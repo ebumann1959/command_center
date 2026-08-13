@@ -13,10 +13,14 @@ Two kinds of backends:
   * systemd units (started/stopped via ``systemctl``)
   * docker compose projects (started/stopped via ``docker compose``)
 
-Status is polled every 5 seconds in a background thread so the UI never
-blocks, and toggling a switch runs the start/stop command in its own
-background thread, disabling the switch and showing a small busy indicator
-until the command finishes and the real status has been re-confirmed.
+Status is polled every 10 seconds in a background thread so the UI never
+blocks. Each poll makes exactly two subprocess calls total -- one batched
+``systemctl is-active`` covering every systemd-backed service, and one
+``docker ps`` covering every docker-compose-backed service -- rather than
+one subprocess per service (docker CLI startup is expensive on a Pi).
+Toggling a switch runs the start/stop command in its own background
+thread, disabling the switch and showing a small busy indicator until the
+command finishes and the real status has been re-confirmed.
 
 Privileges
 ----------
@@ -239,6 +243,56 @@ class DockerComposeService(Service):
 
     def stop(self) -> tuple[bool, str]:
         return self._run(self.stop_cmd)
+
+
+def batch_systemd_is_active(units: list[str]) -> dict[str, bool]:
+    """Check active state for many systemd units in a single subprocess call.
+
+    ``systemctl is-active unit1 unit2 ...`` prints one line per unit, in
+    argument order, regardless of the overall exit code (which is nonzero
+    if *any* unit isn't active) -- so this replaces N `systemctl is-active`
+    subprocess spawns with exactly one.
+    """
+    if not units:
+        return {}
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", *units],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        lines = result.stdout.splitlines()
+        return {
+            unit: (lines[i].strip() == "active" if i < len(lines) else False)
+            for i, unit in enumerate(units)
+        }
+    except Exception:
+        return {unit: False for unit in units}
+
+
+def batch_docker_running_projects() -> set[str]:
+    """Return the set of compose project names with at least one running
+    container, from a single ``docker ps`` call.
+
+    Docker CLI startup is expensive on a Pi, so this replaces one
+    ``docker ps``/``docker compose ps`` invocation per docker-backed
+    service with a single call covering all of them.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "docker", "ps",
+                "--filter", "status=running",
+                "--format", '{{.Label "com.docker.compose.project"}}',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    except Exception:
+        return set()
 
 
 def resolve_glitchtip_dir() -> Optional[str]:
@@ -621,9 +675,22 @@ class PiControlPanelWindow(Gtk.ApplicationWindow):
 
         self.connect("close-request", self.on_close_request)
 
-        # Kick off periodic polling every 5 seconds, plus an immediate poll.
-        GLib.idle_add(self.poll_all_services)
-        GLib.timeout_add_seconds(5, self.poll_all_services)
+        # Kick off periodic polling every 10 seconds, plus an immediate poll.
+        #
+        # NOTE: poll_all_services() always returns GLib.SOURCE_CONTINUE (it's
+        # meant to be a repeating timeout callback). Passing it straight to
+        # GLib.idle_add() for the "immediate poll" was a real bug: idle_add
+        # treats a SOURCE_CONTINUE return the same as a timeout source would
+        # -- "call me again" -- but an idle source refires on every main-loop
+        # idle iteration, not once every N seconds. That turned the "one
+        # immediate poll" into an unbounded, back-to-back polling loop
+        # (measured: a fresh `systemctl`/`docker` subprocess pair firing
+        # roughly once per second, not once per timer interval), which was
+        # the dominant CPU cost -- independent of and larger than the
+        # per-poll subprocess count fixed above. Call it directly instead so
+        # it runs exactly once at startup.
+        self.poll_all_services()
+        GLib.timeout_add_seconds(10, self.poll_all_services)
 
     # -- Resize grips ------------------------------------------------------
 
@@ -710,20 +777,32 @@ class PiControlPanelWindow(Gtk.ApplicationWindow):
             # worker threads race, and whichever result lands second
             # -- not whichever is freshest -- would win, bouncing the
             # switch back and forth. Skip this tick; the timer keeps
-            # firing every 5s regardless.
+            # firing every 10s regardless.
             return GLib.SOURCE_CONTINUE
 
         self._poll_in_flight = True
         rows = list(self.services_by_row)
 
         def worker() -> None:
+            # One subprocess call per *backend kind*, not one per service:
+            # `systemctl is-active` accepts multiple unit names and prints
+            # one status line per unit, and a single `docker ps` lists every
+            # running container's compose project. This replaces ~11
+            # `systemctl` spawns + 3 `docker` spawns per poll with exactly
+            # two subprocess calls total.
+            systemd_rows = [r for r in rows if isinstance(r.service, SystemdService)]
+            docker_rows = [r for r in rows if isinstance(r.service, DockerComposeService)]
+
+            systemd_states = batch_systemd_is_active(
+                [r.service.unit for r in systemd_rows]
+            )
+            running_projects = batch_docker_running_projects()
+
             results = []
-            for row in rows:
-                try:
-                    active = row.service.is_active()
-                except Exception:
-                    active = False
-                results.append((row, active))
+            for row in systemd_rows:
+                results.append((row, systemd_states.get(row.service.unit, False)))
+            for row in docker_rows:
+                results.append((row, row.service.project in running_projects))
             GLib.idle_add(self._apply_poll_results, results)
 
         threading.Thread(target=worker, daemon=True).start()
