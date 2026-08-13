@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launcher for pi-control-panel. Does NOT need to run as root -- main.py
+# Launcher for Fuse Box. Does NOT need to run as root -- main.py
 # uses `sudo -n` internally for the specific systemctl actions it needs.
 set -euo pipefail
 
