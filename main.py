@@ -361,22 +361,6 @@ window.pi-control-panel {
     background-color: #0a0a0a;
 }
 
-headerbar {
-    background-color: #151520;
-    color: #00e5ff;
-    min-height: 36px;
-}
-
-headerbar .title {
-    color: #00e5ff;
-    font-weight: bold;
-    letter-spacing: 2px;
-}
-
-headerbar windowcontrols button {
-    color: #e0e0e0;
-}
-
 .section-header {
     color: #00e5ff;
     font-weight: bold;
@@ -548,7 +532,7 @@ class PiControlPanelWindow(Gtk.ApplicationWindow):
     def __init__(self, app: Gtk.Application):
         super().__init__(application=app)
         self.add_css_class("pi-control-panel")
-        self.set_titlebar(self._build_headerbar())
+        self.set_title("Pi Control")
         self.set_resizable(True)
         self.set_size_request(240, 300)
         self.set_default_size(*self._load_size())
@@ -587,17 +571,6 @@ class PiControlPanelWindow(Gtk.ApplicationWindow):
         GLib.timeout_add_seconds(5, self.poll_all_services)
 
     # -- UI construction -----------------------------------------------
-
-    def _build_headerbar(self) -> Gtk.HeaderBar:
-        # A regular Gtk.HeaderBar gives native drag-to-move, native
-        # edge/corner resizing on all sides (handled entirely by the
-        # window manager / compositor), and a native close button --
-        # replacing the old undecorated-window + custom drag-handle +
-        # custom corner resize-grip approach.
-        header = Gtk.HeaderBar()
-        header.set_title_widget(Gtk.Label(label="Pi Control"))
-        header.set_show_title_buttons(True)
-        return header
 
     def _build_service_sections(self, content: Gtk.Box) -> None:
         for category, services in build_services().items():
