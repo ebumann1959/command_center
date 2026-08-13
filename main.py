@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """
-Pi Control Panel
-=================
+Fuse Box
+========
 
 A GTK4 touchscreen widget for a Raspberry Pi 5 that lets you flip services
 on/off with a row of switches.
@@ -34,7 +34,7 @@ This app is NOT meant to be run as root. Instead:
     works for any user.
 
     For start/stop to work without a password prompt, add a narrowly
-    scoped NOPASSWD rule with ``sudo visudo -f /etc/sudoers.d/pi-control-panel``,
+    scoped NOPASSWD rule with ``sudo visudo -f /etc/sudoers.d/fuse-box``,
     e.g.:
 
         evan ALL=(root) NOPASSWD: /usr/bin/systemctl start ollama, \
@@ -57,8 +57,8 @@ This app is NOT meant to be run as root. Instead:
             /usr/bin/systemctl stop hermes-gateway, \
             /usr/bin/systemctl start voice-control, \
             /usr/bin/systemctl stop voice-control, \
-            /usr/bin/systemctl start wayvnc, \
-            /usr/bin/systemctl stop wayvnc
+            /usr/bin/systemctl start vncserver-x11-serviced, \
+            /usr/bin/systemctl stop vncserver-x11-serviced
 
   * docker commands run as the invoking user directly. This requires the
     user to be a member of the ``docker`` group (``sudo usermod -aG docker
@@ -94,7 +94,7 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("Graphene", "1.0")
 from gi.repository import Gdk, GLib, Graphene, Gtk  # noqa: E402
 
-CONFIG_DIR = Path.home() / ".config" / "pi-control-panel"
+CONFIG_DIR = Path.home() / ".config" / "fuse-box"
 CONFIG_FILE = CONFIG_DIR / "position.json"
 
 # Resolved lazily by inspecting running containers; see resolve_glitchtip_dir().
@@ -155,7 +155,7 @@ class SystemdService(Service):
                 return False, (
                     f"sudo requires a password for 'systemctl {action} {self.unit}'. "
                     "Add a NOPASSWD sudoers rule (see main.py docstring / "
-                    "sudo visudo -f /etc/sudoers.d/pi-control-panel)."
+                    "sudo visudo -f /etc/sudoers.d/fuse-box)."
                 )
             return False, stderr or f"systemctl {action} {self.unit} failed"
         except FileNotFoundError:
@@ -403,7 +403,7 @@ def build_services() -> dict[str, list[Service]]:
         ],
         "System": [
             SystemdService("Voice Control", "voice-control"),
-            SystemdService("WayVNC", "wayvnc"),
+            SystemdService("RealVNC", "vncserver-x11-serviced"),
         ],
     }
 
@@ -413,7 +413,7 @@ def build_services() -> dict[str, list[Service]]:
 # ---------------------------------------------------------------------------
 
 CSS = b"""
-window.pi-control-panel {
+window.fuse-box {
     background-color: #0a0a0a;
 }
 
@@ -633,8 +633,8 @@ class ServiceRow(Gtk.Box):
 class PiControlPanelWindow(Gtk.ApplicationWindow):
     def __init__(self, app: Gtk.Application):
         super().__init__(application=app)
-        self.add_css_class("pi-control-panel")
-        self.set_title("Pi Control")
+        self.add_css_class("fuse-box")
+        self.set_title("Fuse Box")
         self.set_resizable(True)
         self.set_size_request(240, 300)
         self.set_default_size(*self._load_size())

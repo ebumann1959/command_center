@@ -18,11 +18,11 @@ Everything else in this file applies to you as written — the HARD RULES especi
 
 ## Project Overview
 
-**Command Center** is a GTK4 desktop widget for the Raspberry Pi 5 touchscreen that provides
+**Fuse Box** is a GTK4 desktop widget for the Raspberry Pi 5 touchscreen that provides
 toggle switches to start/stop services, Docker stacks, and project brains running on the Pi.
 
-- **Repo**: `ebumann1959/command_center`
-- **Pi location**: `/home/Evan/pi-control-panel/`
+- **Repo**: `ebumann1959/fuse_box`
+- **Pi location**: `/home/Evan/fuse-box/`
 - **Runtime**: Python 3 + GTK4/Adwayland on the Pi's touchscreen
 - **Target**: Pi 5 at `10.0.0.9` (Tailscale: `100.104.189.48`)
 
@@ -45,7 +45,7 @@ The widget controls these services on the Pi:
 | Projects | Sous-Chef | systemctl |
 | Agents | Hermes Gateway | systemctl |
 | System | Voice Control | systemctl |
-| System | WayVNC | systemctl |
+| System | RealVNC | systemctl |
 
 New services should be added to the `SERVICES` list in `main.py`.
 
@@ -72,7 +72,7 @@ This runs directly on the Pi — no containers, no remote deploy. Changes are de
 pulling the repo on the Pi and restarting the widget.
 
 ```bash
-ssh 10.0.0.9 'cd ~/pi-control-panel && git pull origin main'
+ssh 10.0.0.9 'cd ~/fuse-box && git pull origin main'
 ```
 
 If the widget is running, restart it after pulling.
@@ -82,7 +82,7 @@ If the widget is running, restart it after pulling.
 - **Dark theme**: near-black (#0a0a0f) background, cyan (#00e5ff) accents
 - **Touch-friendly**: minimum 44px touch targets
 - **WM-native frame**: server-side decorations — a plain decorated
-  `Gtk.ApplicationWindow` with `set_title("Pi Control")` and no
+  `Gtk.ApplicationWindow` with `set_title("Fuse Box")` and no
   `Gtk.HeaderBar`/`set_titlebar()`. This gives the normal Openbox titlebar
   (drag to move, minimise/maximise/close). Do not reintroduce
   `Gtk.HeaderBar`/`set_titlebar()` or call `set_decorated(False)`
