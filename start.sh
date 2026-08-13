@@ -5,7 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if ! python3 -c "import gi; gi.require_version('Gtk', '4.0'); from gi.repository import Gtk" >/dev/null 2>&1; then
+if ! /usr/bin/python3 -c "import gi; gi.require_version('Gtk', '4.0'); from gi.repository import Gtk" >/dev/null 2>&1; then
     echo "error: python3 GTK4 bindings (PyGObject) not found." >&2
     echo "       install with: sudo apt install python3-gi gir1.2-gtk-4.0" >&2
     exit 1
@@ -19,4 +19,4 @@ else
     echo "         sudo usermod -aG docker \"\$USER\" && re-login" >&2
 fi
 
-exec python3 "${SCRIPT_DIR}/main.py" "$@"
+exec /usr/bin/python3 "${SCRIPT_DIR}/main.py" "$@"
