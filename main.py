@@ -437,6 +437,13 @@ scrolledwindow {
     background-color: #0a0a0a;
 }
 
+.resize-grip {
+    color: #00838f;
+    font-size: 16px;
+    min-width: 28px;
+    min-height: 28px;
+}
+
 label.error-label {
     color: #ff8866;
     font-size: 11px;
@@ -540,6 +547,17 @@ class ServiceRow(Gtk.Box):
 
     def refresh_from_poll(self, actual_active: bool) -> None:
         if self._busy:
+            # A start/stop command is in flight for this row -- a poll
+            # result racing against it is stale by definition; let
+            # _finish() (which re-confirms status itself) drive the
+            # final state instead of overwriting it here.
+            return
+        if self.switch.get_active() == actual_active:
+            # Nothing changed -- skip touching the switch entirely.
+            # Calling set_active()/set_state() even with the same value
+            # still re-triggers GTK's switch slider animation on every
+            # 5s poll, which is what produced the on/off "flicker" for
+            # services that were steadily active the whole time.
             return
         self.set_active_silently(actual_active)
 
@@ -549,6 +567,8 @@ class PiControlPanelWindow(Gtk.ApplicationWindow):
         super().__init__(application=app)
         self.add_css_class("pi-control-panel")
         self.set_decorated(False)
+        self.set_resizable(True)
+        self.set_size_request(240, 300)
         self.set_default_size(*self._load_size())
 
         # Best-effort always-on-top: GTK4 removed Gtk.Window.set_keep_above,
@@ -563,9 +583,17 @@ class PiControlPanelWindow(Gtk.ApplicationWindow):
         # if it supports it.
 
         self.services_by_row: list[ServiceRow] = []
+        self._poll_in_flight = False
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.set_child(outer)
+
+        # The window is undecorated (no title bar), so there is no OS-level
+        # edge/corner grab to resize it -- overlay a small drag handle in
+        # the bottom-right corner that drives Gdk's own interactive resize.
+        overlay = Gtk.Overlay()
+        overlay.set_child(outer)
+        overlay.add_overlay(self._build_resize_grip())
+        self.set_child(overlay)
 
         outer.append(self._build_drag_handle())
 
@@ -645,9 +673,56 @@ class PiControlPanelWindow(Gtk.ApplicationWindow):
     def on_drag_end(self, gesture: Gtk.GestureDrag, offset_x: float, offset_y: float) -> None:
         self._save_position()
 
+    # -- Resizing (GTK4 idiom: surface.begin_resize on a corner grip) ---
+
+    def _build_resize_grip(self) -> Gtk.Widget:
+        grip = Gtk.Label(label="⇲")
+        grip.add_css_class("resize-grip")
+        grip.set_halign(Gtk.Align.END)
+        grip.set_valign(Gtk.Align.END)
+        grip.set_margin_end(2)
+        grip.set_margin_bottom(2)
+        grip.set_cursor(Gdk.Cursor.new_from_name("se-resize"))
+
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self.on_resize_begin)
+        drag.connect("drag-end", self.on_resize_end)
+        grip.add_controller(drag)
+
+        return grip
+
+    def on_resize_begin(self, gesture: Gtk.GestureDrag, start_x: float, start_y: float) -> None:
+        surface = self.get_surface()
+        if surface is None:
+            return
+        device = gesture.get_device()
+        button = gesture.get_current_button()
+        sequence = gesture.get_current_sequence()
+        event = gesture.get_last_event(sequence)
+        timestamp = event.get_time() if event is not None else Gdk.CURRENT_TIME
+        try:
+            # Same rationale as on_drag_begin: no portable GTK4 API beyond
+            # the toplevel surface's own interactive-resize request.
+            surface.begin_resize(Gdk.SurfaceEdge.SOUTH_EAST, device, button, start_x, start_y, timestamp)
+        except (AttributeError, TypeError):
+            pass
+
+    def on_resize_end(self, gesture: Gtk.GestureDrag, offset_x: float, offset_y: float) -> None:
+        self._save_position()
+
     # -- Polling ----------------------------------------------------------
 
     def poll_all_services(self) -> bool:
+        if self._poll_in_flight:
+            # The previous poll (e.g. a slow `docker ps` call) hasn't
+            # returned yet. Starting another one here would let two
+            # worker threads race, and whichever result lands second
+            # -- not whichever is freshest -- would win, bouncing the
+            # switch back and forth. Skip this tick; the timer keeps
+            # firing every 5s regardless.
+            return GLib.SOURCE_CONTINUE
+
+        self._poll_in_flight = True
         rows = list(self.services_by_row)
 
         def worker() -> None:
@@ -666,6 +741,7 @@ class PiControlPanelWindow(Gtk.ApplicationWindow):
     def _apply_poll_results(self, results: list[tuple[ServiceRow, bool]]) -> bool:
         for row, active in results:
             row.refresh_from_poll(active)
+        self._poll_in_flight = False
         return GLib.SOURCE_REMOVE
 
     # -- Position persistence ---------------------------------------------
@@ -676,7 +752,7 @@ class PiControlPanelWindow(Gtk.ApplicationWindow):
                 data = json.loads(CONFIG_FILE.read_text())
                 width = int(data.get("width", 420))
                 height = int(data.get("height", 640))
-                return max(width, 300), max(height, 400)
+                return max(width, 240), max(height, 300)
         except Exception:
             pass
         return 420, 640

@@ -82,8 +82,12 @@ If the widget is running, restart it after pulling.
 - **Dark theme**: near-black (#0a0a0f) background, cyan (#00e5ff) accents
 - **Touch-friendly**: minimum 44px touch targets
 - **Draggable**: undecorated window with custom drag handle
+- **Resizable**: undecorated windows get no OS edge/corner grab, so a
+  bottom-right corner grip drives `surface.begin_resize()`; minimum size
+  is 240x300
 - **Always-on-top**: stays visible on the Pi desktop
-- **Position persistence**: saves/restores window position
+- **Size persistence**: saves/restores window width and height (not
+  position -- GTK4/Wayland has no portable get-position API)
 
 ## Documentation Updates
 
