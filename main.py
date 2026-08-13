@@ -3,8 +3,8 @@
 Pi Control Panel
 =================
 
-A borderless GTK4 touchscreen widget for a Raspberry Pi 5 that lets you
-flip services on/off with a row of switches.
+A GTK4 touchscreen widget for a Raspberry Pi 5 that lets you flip services
+on/off with a row of switches.
 
 What it controls
 -----------------
@@ -361,31 +361,20 @@ window.pi-control-panel {
     background-color: #0a0a0a;
 }
 
-.drag-handle {
-    background-color: #101418;
-    border-bottom: 1px solid #00e5ff;
-    min-height: 34px;
+headerbar {
+    background-color: #151520;
+    color: #00e5ff;
+    min-height: 36px;
 }
 
-.drag-handle-label {
+headerbar .title {
     color: #00e5ff;
     font-weight: bold;
-    font-size: 14px;
     letter-spacing: 2px;
 }
 
-.close-button {
-    background: transparent;
-    color: #ff5566;
-    font-weight: bold;
-    min-width: 36px;
-    min-height: 28px;
-    border-radius: 6px;
-    border: none;
-}
-
-.close-button:hover {
-    background-color: rgba(255, 85, 102, 0.2);
+headerbar windowcontrols button {
+    color: #e0e0e0;
 }
 
 .section-header {
@@ -435,13 +424,6 @@ switch:checked {
 
 scrolledwindow {
     background-color: #0a0a0a;
-}
-
-.resize-grip {
-    color: #00838f;
-    font-size: 16px;
-    min-width: 28px;
-    min-height: 28px;
 }
 
 label.error-label {
@@ -566,7 +548,7 @@ class PiControlPanelWindow(Gtk.ApplicationWindow):
     def __init__(self, app: Gtk.Application):
         super().__init__(application=app)
         self.add_css_class("pi-control-panel")
-        self.set_decorated(False)
+        self.set_titlebar(self._build_headerbar())
         self.set_resizable(True)
         self.set_size_request(240, 300)
         self.set_default_size(*self._load_size())
@@ -586,16 +568,7 @@ class PiControlPanelWindow(Gtk.ApplicationWindow):
         self._poll_in_flight = False
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-
-        # The window is undecorated (no title bar), so there is no OS-level
-        # edge/corner grab to resize it -- overlay a small drag handle in
-        # the bottom-right corner that drives Gdk's own interactive resize.
-        overlay = Gtk.Overlay()
-        overlay.set_child(outer)
-        overlay.add_overlay(self._build_resize_grip())
-        self.set_child(overlay)
-
-        outer.append(self._build_drag_handle())
+        self.set_child(outer)
 
         scroller = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -615,27 +588,16 @@ class PiControlPanelWindow(Gtk.ApplicationWindow):
 
     # -- UI construction -----------------------------------------------
 
-    def _build_drag_handle(self) -> Gtk.Widget:
-        handle = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        handle.add_css_class("drag-handle")
-        handle.set_margin_start(10)
-        handle.set_margin_end(10)
-
-        label = Gtk.Label(label="⋮⋮  Pi Control Panel  ⋮⋮", hexpand=True)
-        label.add_css_class("drag-handle-label")
-        handle.append(label)
-
-        close_button = Gtk.Button(label="✕")
-        close_button.add_css_class("close-button")
-        close_button.connect("clicked", lambda *_: self.close())
-        handle.append(close_button)
-
-        drag = Gtk.GestureDrag()
-        drag.connect("drag-begin", self.on_drag_begin)
-        drag.connect("drag-end", self.on_drag_end)
-        handle.add_controller(drag)
-
-        return handle
+    def _build_headerbar(self) -> Gtk.HeaderBar:
+        # A regular Gtk.HeaderBar gives native drag-to-move, native
+        # edge/corner resizing on all sides (handled entirely by the
+        # window manager / compositor), and a native close button --
+        # replacing the old undecorated-window + custom drag-handle +
+        # custom corner resize-grip approach.
+        header = Gtk.HeaderBar()
+        header.set_title_widget(Gtk.Label(label="Pi Control"))
+        header.set_show_title_buttons(True)
+        return header
 
     def _build_service_sections(self, content: Gtk.Box) -> None:
         for category, services in build_services().items():
@@ -647,68 +609,6 @@ class PiControlPanelWindow(Gtk.ApplicationWindow):
                 row = ServiceRow(service)
                 self.services_by_row.append(row)
                 content.append(row)
-
-    # -- Dragging (GTK4 idiom: surface.begin_move on the drag handle) ---
-
-    def on_drag_begin(self, gesture: Gtk.GestureDrag, start_x: float, start_y: float) -> None:
-        surface = self.get_surface()
-        if surface is None:
-            return
-        device = gesture.get_device()
-        button = gesture.get_current_button()
-        sequence = gesture.get_current_sequence()
-        event = gesture.get_last_event(sequence)
-        timestamp = event.get_time() if event is not None else Gdk.CURRENT_TIME
-        try:
-            # Standard GTK4 pattern for custom-drag (undecorated) windows.
-            # Works on both X11 and Wayland compositors that implement the
-            # relevant move-request (xdg-toplevel "move" on Wayland,
-            # _NET_WM_MOVERESIZE on X11) -- GTK picks the right one.
-            surface.begin_move(device, button, start_x, start_y, timestamp)
-        except (AttributeError, TypeError):
-            # Older/newer GTK versions may have a slightly different
-            # signature; fail quietly rather than crash the app.
-            pass
-
-    def on_drag_end(self, gesture: Gtk.GestureDrag, offset_x: float, offset_y: float) -> None:
-        self._save_position()
-
-    # -- Resizing (GTK4 idiom: surface.begin_resize on a corner grip) ---
-
-    def _build_resize_grip(self) -> Gtk.Widget:
-        grip = Gtk.Label(label="⇲")
-        grip.add_css_class("resize-grip")
-        grip.set_halign(Gtk.Align.END)
-        grip.set_valign(Gtk.Align.END)
-        grip.set_margin_end(2)
-        grip.set_margin_bottom(2)
-        grip.set_cursor(Gdk.Cursor.new_from_name("se-resize"))
-
-        drag = Gtk.GestureDrag()
-        drag.connect("drag-begin", self.on_resize_begin)
-        drag.connect("drag-end", self.on_resize_end)
-        grip.add_controller(drag)
-
-        return grip
-
-    def on_resize_begin(self, gesture: Gtk.GestureDrag, start_x: float, start_y: float) -> None:
-        surface = self.get_surface()
-        if surface is None:
-            return
-        device = gesture.get_device()
-        button = gesture.get_current_button()
-        sequence = gesture.get_current_sequence()
-        event = gesture.get_last_event(sequence)
-        timestamp = event.get_time() if event is not None else Gdk.CURRENT_TIME
-        try:
-            # Same rationale as on_drag_begin: no portable GTK4 API beyond
-            # the toplevel surface's own interactive-resize request.
-            surface.begin_resize(Gdk.SurfaceEdge.SOUTH_EAST, device, button, start_x, start_y, timestamp)
-        except (AttributeError, TypeError):
-            pass
-
-    def on_resize_end(self, gesture: Gtk.GestureDrag, offset_x: float, offset_y: float) -> None:
-        self._save_position()
 
     # -- Polling ----------------------------------------------------------
 

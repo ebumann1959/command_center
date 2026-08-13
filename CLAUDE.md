@@ -81,10 +81,11 @@ If the widget is running, restart it after pulling.
 
 - **Dark theme**: near-black (#0a0a0f) background, cyan (#00e5ff) accents
 - **Touch-friendly**: minimum 44px touch targets
-- **Draggable**: undecorated window with custom drag handle
-- **Resizable**: undecorated windows get no OS edge/corner grab, so a
-  bottom-right corner grip drives `surface.begin_resize()`; minimum size
-  is 240x300
+- **Native titlebar**: a regular decorated window with a `Gtk.HeaderBar`
+  (title "Pi Control", styled dark via CSS) gives native drag-to-move and
+  native close — no custom drag handle
+- **Resizable**: native edge/corner resizing on all sides, handled by the
+  window manager/compositor; minimum size is 240x300
 - **Always-on-top**: stays visible on the Pi desktop
 - **Size persistence**: saves/restores window width and height (not
   position -- GTK4/Wayland has no portable get-position API)
