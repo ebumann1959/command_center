@@ -81,11 +81,16 @@ If the widget is running, restart it after pulling.
 
 - **Dark theme**: near-black (#0a0a0f) background, cyan (#00e5ff) accents
 - **Touch-friendly**: minimum 44px touch targets
-- **Native titlebar**: a regular decorated window with a `Gtk.HeaderBar`
-  (title "Pi Control", styled dark via CSS) gives native drag-to-move and
-  native close — no custom drag handle
+- **WM-native frame**: server-side decorations — a plain decorated
+  `Gtk.ApplicationWindow` with `set_title("Pi Control")` and no
+  `Gtk.HeaderBar`/`set_titlebar()`. On the Pi's X11 session
+  (Openbox/PIXEL desktop, RealVNC, no compositor), client-side decoration
+  (CSD) draws ~2px resize borders that only the top corners respond to;
+  letting the window manager draw the frame instead gives a normal
+  titlebar and full-width resize edges on all sides. Do not reintroduce
+  `Gtk.HeaderBar`/`set_titlebar()` or call `set_decorated(False)`
 - **Resizable**: native edge/corner resizing on all sides, handled by the
-  window manager/compositor; minimum size is 240x300
+  window manager (Openbox); minimum size is 240x300
 - **Always-on-top**: stays visible on the Pi desktop
 - **Size persistence**: saves/restores window width and height (not
   position -- GTK4/Wayland has no portable get-position API)
