@@ -83,14 +83,60 @@ If the widget is running, restart it after pulling.
 - **Touch-friendly**: minimum 44px touch targets
 - **WM-native frame**: server-side decorations — a plain decorated
   `Gtk.ApplicationWindow` with `set_title("Pi Control")` and no
-  `Gtk.HeaderBar`/`set_titlebar()`. On the Pi's X11 session
-  (Openbox/PIXEL desktop, RealVNC, no compositor), client-side decoration
-  (CSD) draws ~2px resize borders that only the top corners respond to;
-  letting the window manager draw the frame instead gives a normal
-  titlebar and full-width resize edges on all sides. Do not reintroduce
+  `Gtk.HeaderBar`/`set_titlebar()`. This gives the normal Openbox titlebar
+  (drag to move, minimise/maximise/close). Do not reintroduce
   `Gtk.HeaderBar`/`set_titlebar()` or call `set_decorated(False)`
-- **Resizable**: native edge/corner resizing on all sides, handled by the
-  window manager (Openbox); minimum size is 240x300
+- **Resizable**: minimum size 240x300. The titlebar and its top corners are
+  the WM's; **every other edge is the app's own**, via invisible grab zones —
+  see below
+
+#### Why the app draws its own resize zones
+
+Measured on the Pi, 2026-08-12:
+
+```
+xprop -root _NET_SUPPORTING_WM_CHECK   ->  Openbox (--config-file ~/.config/openbox/rpd-rc.xml)
+xprop -id <win> _NET_FRAME_EXTENTS     ->  0, 0, 28, 0        # left, right, TOP, bottom
+grep border /usr/share/themes/PiXonyx/openbox-3/themerc
+    border.width: 0
+    window.handle.width: 0
+```
+
+Left, right and bottom frame extents are **zero**. The Openbox theme shipped
+with Raspberry Pi OS (`PiXonyx`) draws a 28px titlebar and nothing else — no
+side border, no bottom handle. That is the entire reason only the top corners
+ever resized, and it is a property of the *desktop theme*, not of this window:
+neither CSD (PR #3) nor SSD (PR #4) could fix it, and raising the theme's
+`border.width` would repaint every window on the desktop.
+
+So `main.py` supplies its own hit zones (`_RESIZE_GRIPS`, `_add_resize_grips`,
+`_on_grip_pressed`): invisible `Gtk.Box` strips stacked in a `Gtk.Overlay`
+along the left/right/bottom edges (10px) and the two bottom corners (20px),
+each with a `Gtk.GestureClick` that calls `Gdk.Toplevel.begin_resize()`. On
+X11 that sends the WM a `_NET_WM_MOVERESIZE` message and Openbox runs its
+normal interactive resize — identical to dragging a real border, but with a
+grab zone we control the size of. `set_button(0)` on the gesture so touch
+presses count too.
+
+Verified by `xdotool` drag on the live display (`DISPLAY=:0`, 800x500 window):
+
+| Drag | Before | After (stock `main`) | After (with grips) |
+|---|---|---|---|
+| right edge, +100px x | 800x500 | 800x500 (dead) | 896x500 |
+| bottom edge, +100px y | 800x500 | 800x500 (dead) | 896x596 |
+| bottom-right, +80,+80 | 800x500 | 800x500 (dead) | 976x676 |
+| left edge, -100px x | 800x500 | 800x500 (dead) | 1072x676 @x-96 |
+| bottom-left, -80,+60 | 800x500 | 800x500 (dead) | 1152x732 @x-80 |
+| titlebar, +40,+32 | — | moves (+40,+32) | still moves |
+
+Two traps when re-testing this with `xdotool`:
+
+- **`xdotool getwindowgeometry` misreports Y** under Openbox's reparenting —
+  it returned `356` where the client really started at `328`, which is enough
+  to put every "bottom edge" click *below* the window and make a working fix
+  look dead. Use `xwininfo -id <win>` → `Absolute upper-left X/Y`.
+- **Drag with `xdotool mousemove_relative` in several small steps**, not one
+  absolute jump; Openbox needs the intermediate motion events.
 - **Always-on-top**: stays visible on the Pi desktop
 - **Size persistence**: saves/restores window width and height (not
   position -- GTK4/Wayland has no portable get-position API)

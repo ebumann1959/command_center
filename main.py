@@ -86,7 +86,9 @@ from typing import Callable, Optional
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+gi.require_version("Gdk", "4.0")
+gi.require_version("Graphene", "1.0")
+from gi.repository import Gdk, GLib, Graphene, Gtk  # noqa: E402
 
 CONFIG_DIR = Path.home() / ".config" / "pi-control-panel"
 CONFIG_FILE = CONFIG_DIR / "position.json"
@@ -417,6 +419,52 @@ label.error-label {
 """
 
 
+# ---------------------------------------------------------------------------
+# Resize grips
+# ---------------------------------------------------------------------------
+#
+# Why this exists (measured on the Pi, 2026-08-12):
+#
+#   $ xprop -root _NET_SUPPORTING_WM_CHECK      -> Openbox (rpd-rc.xml)
+#   $ xprop -id <win> _NET_FRAME_EXTENTS        -> 0, 0, 28, 0
+#   $ grep border /usr/share/themes/PiXonyx/openbox-3/themerc
+#       border.width: 0
+#       window.handle.width: 0
+#
+# left = right = bottom = 0. The Openbox theme shipped with Raspberry Pi OS
+# (PiXonyx) draws a 28px titlebar and *nothing else* -- there is no side
+# border and no bottom handle to grab, which is exactly why only the top
+# corners ever responded. This is a property of the WM theme, not of the
+# window: switching between CSD (PR #3) and SSD (PR #4) cannot fix it, and
+# raising the theme's border.width would repaint every window on the desktop.
+#
+# So the window supplies its own hit zones. Invisible strips are stacked in a
+# Gtk.Overlay along the left/right/bottom edges and the two bottom corners; a
+# press on one calls Gdk.Toplevel.begin_resize(), which on X11 sends the WM a
+# _NET_WM_MOVERESIZE message. Openbox then runs its own normal interactive
+# resize -- identical to dragging a border on a theme that has one, but with a
+# grab zone we control the size of (10px edges / 20px corners) instead of 0px.
+
+RESIZE_GRIP_PX = 10
+RESIZE_CORNER_PX = 20
+
+# (edge, halign, valign, width, height, cursor-name)
+# Edges first, corners last: Gtk.Overlay stacks in insertion order, so the
+# corner boxes sit on top of the two edge strips they overlap.
+_RESIZE_GRIPS = (
+    (Gdk.SurfaceEdge.WEST, Gtk.Align.START, Gtk.Align.FILL,
+     RESIZE_GRIP_PX, -1, "w-resize"),
+    (Gdk.SurfaceEdge.EAST, Gtk.Align.END, Gtk.Align.FILL,
+     RESIZE_GRIP_PX, -1, "e-resize"),
+    (Gdk.SurfaceEdge.SOUTH, Gtk.Align.FILL, Gtk.Align.END,
+     -1, RESIZE_GRIP_PX, "s-resize"),
+    (Gdk.SurfaceEdge.SOUTH_WEST, Gtk.Align.START, Gtk.Align.END,
+     RESIZE_CORNER_PX, RESIZE_CORNER_PX, "sw-resize"),
+    (Gdk.SurfaceEdge.SOUTH_EAST, Gtk.Align.END, Gtk.Align.END,
+     RESIZE_CORNER_PX, RESIZE_CORNER_PX, "se-resize"),
+)
+
+
 class ServiceRow(Gtk.Box):
     """One row: label + optional status/error text on the left, switch on the right."""
 
@@ -552,7 +600,14 @@ class PiControlPanelWindow(Gtk.ApplicationWindow):
         self._poll_in_flight = False
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.set_child(outer)
+
+        # The window content sits under an overlay that carries the resize
+        # grips -- see the _RESIZE_GRIPS comment above for why the WM frame
+        # cannot provide them here.
+        self._overlay = Gtk.Overlay()
+        self._overlay.set_child(outer)
+        self.set_child(self._overlay)
+        self._add_resize_grips(self._overlay)
 
         scroller = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -569,6 +624,69 @@ class PiControlPanelWindow(Gtk.ApplicationWindow):
         # Kick off periodic polling every 5 seconds, plus an immediate poll.
         GLib.idle_add(self.poll_all_services)
         GLib.timeout_add_seconds(5, self.poll_all_services)
+
+    # -- Resize grips ------------------------------------------------------
+
+    def _add_resize_grips(self, overlay: Gtk.Overlay) -> None:
+        """Stack invisible edge/corner drag zones on top of the content."""
+        self._resize_grips: list[Gtk.Widget] = []
+        for edge, halign, valign, width, height, cursor_name in _RESIZE_GRIPS:
+            grip = Gtk.Box()
+            grip.set_halign(halign)
+            grip.set_valign(valign)
+            grip.set_size_request(width, height)
+            cursor = Gdk.Cursor.new_from_name(cursor_name, None)
+            if cursor is not None:
+                grip.set_cursor(cursor)
+
+            # button=0 so touch presses (which carry no button number) are
+            # handled too -- this is a touchscreen widget first.
+            gesture = Gtk.GestureClick()
+            gesture.set_button(0)
+            gesture.connect("pressed", self._on_grip_pressed, edge)
+            grip.add_controller(gesture)
+
+            overlay.add_overlay(grip)
+            self._resize_grips.append(grip)
+
+    def _on_grip_pressed(
+        self,
+        gesture: Gtk.GestureClick,
+        _n_press: int,
+        x: float,
+        y: float,
+        edge: Gdk.SurfaceEdge,
+    ) -> None:
+        if not self.get_resizable() or self.is_maximized() or self.is_fullscreen():
+            return
+
+        surface = self.get_native().get_surface() if self.get_native() else None
+        if surface is None or not isinstance(surface, Gdk.Toplevel):
+            return
+
+        event = gesture.get_current_event()
+        if event is None:
+            return
+        device = event.get_device()
+        if device is None:
+            return
+
+        grip = gesture.get_widget()
+        # begin_resize() wants the press position in surface coordinates, but
+        # the gesture reports it relative to the grip widget.
+        point = grip.compute_point(self, Graphene.Point().init(x, y))
+        if isinstance(point, tuple):
+            ok, point = point
+            if not ok:
+                return
+        if point is None:
+            return
+
+        button = gesture.get_current_button() or 1
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        surface.begin_resize(
+            edge, device, button, point.x, point.y, event.get_time()
+        )
 
     # -- UI construction -----------------------------------------------
 
