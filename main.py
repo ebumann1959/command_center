@@ -1,0 +1,742 @@
+#!/usr/bin/env python3
+"""
+Pi Control Panel
+=================
+
+A borderless GTK4 touchscreen widget for a Raspberry Pi 5 that lets you
+flip services on/off with a row of switches.
+
+What it controls
+-----------------
+Two kinds of backends:
+
+  * systemd units (started/stopped via ``systemctl``)
+  * docker compose projects (started/stopped via ``docker compose``)
+
+Status is polled every 5 seconds in a background thread so the UI never
+blocks, and toggling a switch runs the start/stop command in its own
+background thread, disabling the switch and showing a small busy indicator
+until the command finishes and the real status has been re-confirmed.
+
+Privileges
+----------
+This app is NOT meant to be run as root. Instead:
+
+  * systemd start/stop commands are run as ``sudo -n systemctl ...`` -- the
+    ``-n`` flag means "non-interactive": if a password would be required,
+    the command fails immediately instead of hanging forever on a prompt
+    that can never be answered from a background thread. Status checks
+    (``systemctl is-active``) are run without sudo since that normally
+    works for any user.
+
+    For start/stop to work without a password prompt, add a narrowly
+    scoped NOPASSWD rule with ``sudo visudo -f /etc/sudoers.d/pi-control-panel``,
+    e.g.:
+
+        evan ALL=(root) NOPASSWD: /usr/bin/systemctl start ollama, \
+            /usr/bin/systemctl stop ollama, \
+            /usr/bin/systemctl start chroma-server, \
+            /usr/bin/systemctl stop chroma-server, \
+            /usr/bin/systemctl start claims-rag, \
+            /usr/bin/systemctl stop claims-rag, \
+            /usr/bin/systemctl start claims-rag-staging, \
+            /usr/bin/systemctl stop claims-rag-staging, \
+            /usr/bin/systemctl start hivemind-tunnel, \
+            /usr/bin/systemctl stop hivemind-tunnel, \
+            /usr/bin/systemctl start pokemon-play, \
+            /usr/bin/systemctl stop pokemon-play, \
+            /usr/bin/systemctl start shady-engine, \
+            /usr/bin/systemctl stop shady-engine, \
+            /usr/bin/systemctl start sous-chef, \
+            /usr/bin/systemctl stop sous-chef, \
+            /usr/bin/systemctl start hermes-gateway, \
+            /usr/bin/systemctl stop hermes-gateway, \
+            /usr/bin/systemctl start voice-control, \
+            /usr/bin/systemctl stop voice-control, \
+            /usr/bin/systemctl start wayvnc, \
+            /usr/bin/systemctl stop wayvnc
+
+  * docker commands run as the invoking user directly. This requires the
+    user to be a member of the ``docker`` group (``sudo usermod -aG docker
+    $USER``, then re-login). If docker commands fail, the app surfaces the
+    error in the row instead of crashing.
+
+This app never stores a password, never attempts interactive privilege
+escalation, and never writes sudoers rules on your behalf -- if sudo isn't
+configured, it tells you exactly what to add via an in-row error label.
+
+Running it
+----------
+    ./start.sh
+
+or directly:
+
+    python3 main.py
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import threading
+from pathlib import Path
+from typing import Callable, Optional
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+
+CONFIG_DIR = Path.home() / ".config" / "pi-control-panel"
+CONFIG_FILE = CONFIG_DIR / "position.json"
+
+# Resolved lazily by inspecting running containers; see resolve_glitchtip_dir().
+GLITCHTIP_DIR: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Service definitions
+# ---------------------------------------------------------------------------
+
+
+class Service:
+    """Base class for a single toggleable service/row."""
+
+    name: str
+
+    def is_active(self) -> bool:
+        raise NotImplementedError
+
+    def start(self) -> tuple[bool, str]:
+        raise NotImplementedError
+
+    def stop(self) -> tuple[bool, str]:
+        raise NotImplementedError
+
+
+class SystemdService(Service):
+    """A service controlled by a systemd unit."""
+
+    def __init__(self, name: str, unit: str):
+        self.name = name
+        self.unit = unit
+
+    def is_active(self) -> bool:
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", self.unit],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return result.stdout.strip() == "active"
+        except Exception:
+            return False
+
+    def _sudo_systemctl(self, action: str) -> tuple[bool, str]:
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "systemctl", action, self.unit],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                return True, ""
+            stderr = result.stderr.strip()
+            if "password" in stderr.lower():
+                return False, (
+                    f"sudo requires a password for 'systemctl {action} {self.unit}'. "
+                    "Add a NOPASSWD sudoers rule (see main.py docstring / "
+                    "sudo visudo -f /etc/sudoers.d/pi-control-panel)."
+                )
+            return False, stderr or f"systemctl {action} {self.unit} failed"
+        except FileNotFoundError:
+            return False, "sudo not found on this system"
+        except subprocess.TimeoutExpired:
+            return False, f"systemctl {action} {self.unit} timed out"
+        except Exception as exc:  # pragma: no cover - defensive
+            return False, str(exc)
+
+    def start(self) -> tuple[bool, str]:
+        return self._sudo_systemctl("start")
+
+    def stop(self) -> tuple[bool, str]:
+        return self._sudo_systemctl("stop")
+
+
+class DockerComposeService(Service):
+    """A service controlled by a docker compose project."""
+
+    def __init__(
+        self,
+        name: str,
+        project: str,
+        start_cmd: list[str],
+        stop_cmd: list[str],
+        cwd: Optional[str] = None,
+        cwd_resolver: Optional[Callable[[], Optional[str]]] = None,
+    ):
+        self.name = name
+        self.project = project
+        self.start_cmd = start_cmd
+        self.stop_cmd = stop_cmd
+        self._cwd = cwd
+        self._cwd_resolver = cwd_resolver
+
+    def _resolve_cwd(self) -> str:
+        if self._cwd:
+            return self._cwd
+        if self._cwd_resolver is not None:
+            resolved = self._cwd_resolver()
+            if resolved:
+                return resolved
+        return str(Path.home())
+
+    def is_active(self) -> bool:
+        try:
+            result = subprocess.run(
+                [
+                    "docker",
+                    "ps",
+                    "--filter",
+                    f"label=com.docker.compose.project={self.project}",
+                    "--format",
+                    "{{.Names}}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return bool(result.stdout.strip())
+        except Exception:
+            return False
+
+    def _run(self, cmd: list[str]) -> tuple[bool, str]:
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                cwd=self._resolve_cwd(),
+            )
+            if result.returncode == 0:
+                return True, ""
+            return False, result.stderr.strip() or f"{' '.join(cmd)} failed"
+        except FileNotFoundError:
+            return False, "docker not found on this system"
+        except subprocess.TimeoutExpired:
+            return False, f"{' '.join(cmd)} timed out"
+        except Exception as exc:  # pragma: no cover - defensive
+            return False, str(exc)
+
+    def start(self) -> tuple[bool, str]:
+        return self._run(self.start_cmd)
+
+    def stop(self) -> tuple[bool, str]:
+        return self._run(self.stop_cmd)
+
+
+def resolve_glitchtip_dir() -> Optional[str]:
+    """Find GlitchTip's docker compose working directory by inspecting a
+    running (or previously run) container's compose labels. Cached in the
+    module-level GLITCHTIP_DIR constant once resolved.
+    """
+    global GLITCHTIP_DIR
+    if GLITCHTIP_DIR is not None:
+        return GLITCHTIP_DIR
+    try:
+        ps_result = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                "label=com.docker.compose.project=glitchtip",
+                "--format",
+                "{{.ID}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        container_id = ps_result.stdout.strip().splitlines()[0] if ps_result.stdout.strip() else None
+        if not container_id:
+            return None
+        inspect_result = subprocess.run(
+            [
+                "docker",
+                "inspect",
+                container_id,
+                "--format",
+                '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        working_dir = inspect_result.stdout.strip()
+        if working_dir:
+            GLITCHTIP_DIR = working_dir
+            return GLITCHTIP_DIR
+    except Exception:
+        pass
+    # Could not determine it -- fall back to $HOME and let the row's error
+    # label tell the user. Set GLITCHTIP_DIR manually near the top of this
+    # file if this keeps happening on your system.
+    return None
+
+
+def build_services() -> dict[str, list[Service]]:
+    """Return the category -> [Service, ...] map used to build the UI."""
+
+    hivemind_dir = "/home/Evan/archetype-claims-os"
+
+    return {
+        "AI & Inference": [
+            SystemdService("Ollama", "ollama"),
+            SystemdService("Chroma Server", "chroma-server"),
+            SystemdService("Claims RAG (prod)", "claims-rag"),
+            SystemdService("Claims RAG (staging)", "claims-rag-staging"),
+        ],
+        "Platforms": [
+            DockerComposeService(
+                "HiveMind Prod",
+                "hivemind-prod",
+                start_cmd=[
+                    "docker", "compose",
+                    "-f", "docker-compose.yml",
+                    "-f", "docker-compose.prod.yml",
+                    "-p", "hivemind-prod",
+                    "up", "-d",
+                ],
+                stop_cmd=["docker", "compose", "-p", "hivemind-prod", "down"],
+                cwd=hivemind_dir,
+            ),
+            DockerComposeService(
+                "HiveMind Staging",
+                "hivemind-staging",
+                start_cmd=[
+                    "docker", "compose",
+                    "-f", "docker-compose.yml",
+                    "-f", "docker-compose.staging.yml",
+                    "-p", "hivemind-staging",
+                    "up", "-d",
+                ],
+                stop_cmd=["docker", "compose", "-p", "hivemind-staging", "down"],
+                cwd=hivemind_dir,
+            ),
+            DockerComposeService(
+                "GlitchTip",
+                "glitchtip",
+                start_cmd=["docker", "compose", "-p", "glitchtip", "up", "-d"],
+                stop_cmd=["docker", "compose", "-p", "glitchtip", "down"],
+                cwd_resolver=resolve_glitchtip_dir,
+            ),
+            SystemdService("Cloudflare Tunnel", "hivemind-tunnel"),
+        ],
+        "Projects": [
+            SystemdService("Pokemon Brain", "pokemon-play"),
+            SystemdService("Shady Engine", "shady-engine"),
+            SystemdService("Sous-Chef", "sous-chef"),
+        ],
+        "Agents & Comms": [
+            SystemdService("Hermes Gateway", "hermes-gateway"),
+        ],
+        "System": [
+            SystemdService("Voice Control", "voice-control"),
+            SystemdService("WayVNC", "wayvnc"),
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
+CSS = b"""
+window.pi-control-panel {
+    background-color: #0a0a0a;
+}
+
+.drag-handle {
+    background-color: #101418;
+    border-bottom: 1px solid #00e5ff;
+    min-height: 34px;
+}
+
+.drag-handle-label {
+    color: #00e5ff;
+    font-weight: bold;
+    font-size: 14px;
+    letter-spacing: 2px;
+}
+
+.close-button {
+    background: transparent;
+    color: #ff5566;
+    font-weight: bold;
+    min-width: 36px;
+    min-height: 28px;
+    border-radius: 6px;
+    border: none;
+}
+
+.close-button:hover {
+    background-color: rgba(255, 85, 102, 0.2);
+}
+
+.section-header {
+    color: #00e5ff;
+    font-weight: bold;
+    font-size: 16px;
+    margin-top: 14px;
+    margin-bottom: 4px;
+    margin-left: 10px;
+}
+
+.service-row {
+    min-height: 44px;
+    padding: 8px 14px;
+    border-radius: 8px;
+    background-color: #141414;
+    margin: 3px 8px;
+}
+
+.service-row.changing {
+    opacity: 0.55;
+}
+
+.service-label {
+    color: #e6f7ff;
+    font-size: 15px;
+}
+
+.service-status-label {
+    color: #7ab8c4;
+    font-size: 12px;
+}
+
+switch {
+    min-width: 56px;
+    min-height: 32px;
+}
+
+switch slider {
+    min-width: 28px;
+    min-height: 28px;
+}
+
+switch:checked {
+    background-color: #00838f;
+}
+
+scrolledwindow {
+    background-color: #0a0a0a;
+}
+
+label.error-label {
+    color: #ff8866;
+    font-size: 11px;
+}
+"""
+
+
+class ServiceRow(Gtk.Box):
+    """One row: label + optional status/error text on the left, switch on the right."""
+
+    def __init__(self, service: Service):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.service = service
+        self.add_css_class("service-row")
+
+        text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        self.label = Gtk.Label(label=service.name, xalign=0.0)
+        self.label.add_css_class("service-label")
+        text_box.append(self.label)
+
+        self.status_label = Gtk.Label(label="", xalign=0.0)
+        self.status_label.add_css_class("service-status-label")
+        self.status_label.set_visible(False)
+        text_box.append(self.status_label)
+
+        self.append(text_box)
+
+        self.spinner = Gtk.Spinner()
+        self.spinner.set_visible(False)
+        self.append(self.spinner)
+
+        self.switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.switch.connect("state-set", self.on_state_set)
+        self.append(self.switch)
+
+        self._busy = False
+
+    def set_active_silently(self, active: bool) -> None:
+        """Update the switch state without re-triggering state-set."""
+        self.switch.handler_block_by_func(self.on_state_set)
+        self.switch.set_active(active)
+        self.switch.set_state(active)
+        self.switch.handler_unblock_by_func(self.on_state_set)
+
+    def set_busy(self, busy: bool, message: str = "") -> None:
+        self._busy = busy
+        self.switch.set_sensitive(not busy)
+        if busy:
+            self.add_css_class("changing")
+            self.spinner.set_visible(True)
+            self.spinner.start()
+            self.status_label.set_text(message)
+            self.status_label.set_visible(True)
+            self.status_label.remove_css_class("error-label")
+        else:
+            self.remove_css_class("changing")
+            self.spinner.stop()
+            self.spinner.set_visible(False)
+
+    def show_error(self, message: str) -> None:
+        self.status_label.set_text(message)
+        self.status_label.add_css_class("error-label")
+        self.status_label.set_visible(True)
+
+    def clear_status(self) -> None:
+        self.status_label.set_visible(False)
+        self.status_label.set_text("")
+        self.status_label.remove_css_class("error-label")
+
+    def on_state_set(self, switch: Gtk.Switch, requested_state: bool) -> bool:
+        if self._busy:
+            # A command is already in flight; ignore extra toggles.
+            return True
+
+        action_word = "Starting" if requested_state else "Stopping"
+        self.set_busy(True, f"{action_word}...")
+
+        def worker() -> None:
+            if requested_state:
+                ok, err = self.service.start()
+            else:
+                ok, err = self.service.stop()
+            # Re-confirm real status rather than trusting the command result.
+            actual = self.service.is_active()
+            GLib.idle_add(self._finish, actual, ok, err)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        # Returning True prevents GTK from applying requested_state itself;
+        # we drive the final state ourselves in _finish() once confirmed.
+        return True
+
+    def _finish(self, actual_active: bool, ok: bool, err: str) -> bool:
+        self.set_busy(False)
+        self.set_active_silently(actual_active)
+        if not ok and err:
+            self.show_error(err)
+        else:
+            self.clear_status()
+        return GLib.SOURCE_REMOVE
+
+    def refresh_from_poll(self, actual_active: bool) -> None:
+        if self._busy:
+            return
+        self.set_active_silently(actual_active)
+
+
+class PiControlPanelWindow(Gtk.ApplicationWindow):
+    def __init__(self, app: Gtk.Application):
+        super().__init__(application=app)
+        self.add_css_class("pi-control-panel")
+        self.set_decorated(False)
+        self.set_default_size(*self._load_size())
+
+        # Best-effort always-on-top: GTK4 removed Gtk.Window.set_keep_above,
+        # and there is no portable cross-compositor replacement -- whether
+        # this window stays above others depends entirely on the Wayland
+        # compositor (labwc/wayfire) or X11 window manager in use. Some
+        # X11 window managers respect legacy hints GTK sets automatically
+        # for utility-type windows; on Wayland the only reliable route is a
+        # compositor-specific protocol (e.g. wlr-layer-shell) that plain
+        # GTK4 does not expose. No further action is taken here beyond
+        # relying on those defaults -- pin the window via your compositor
+        # if it supports it.
+
+        self.services_by_row: list[ServiceRow] = []
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.set_child(outer)
+
+        outer.append(self._build_drag_handle())
+
+        scroller = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        content.set_margin_top(6)
+        content.set_margin_bottom(10)
+        scroller.set_child(content)
+        outer.append(scroller)
+
+        self._build_service_sections(content)
+
+        self.connect("close-request", self.on_close_request)
+
+        # Kick off periodic polling every 5 seconds, plus an immediate poll.
+        GLib.idle_add(self.poll_all_services)
+        GLib.timeout_add_seconds(5, self.poll_all_services)
+
+    # -- UI construction -----------------------------------------------
+
+    def _build_drag_handle(self) -> Gtk.Widget:
+        handle = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        handle.add_css_class("drag-handle")
+        handle.set_margin_start(10)
+        handle.set_margin_end(10)
+
+        label = Gtk.Label(label="⋮⋮  Pi Control Panel  ⋮⋮", hexpand=True)
+        label.add_css_class("drag-handle-label")
+        handle.append(label)
+
+        close_button = Gtk.Button(label="✕")
+        close_button.add_css_class("close-button")
+        close_button.connect("clicked", lambda *_: self.close())
+        handle.append(close_button)
+
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self.on_drag_begin)
+        drag.connect("drag-end", self.on_drag_end)
+        handle.add_controller(drag)
+
+        return handle
+
+    def _build_service_sections(self, content: Gtk.Box) -> None:
+        for category, services in build_services().items():
+            header = Gtk.Label(label=category, xalign=0.0)
+            header.add_css_class("section-header")
+            content.append(header)
+
+            for service in services:
+                row = ServiceRow(service)
+                self.services_by_row.append(row)
+                content.append(row)
+
+    # -- Dragging (GTK4 idiom: surface.begin_move on the drag handle) ---
+
+    def on_drag_begin(self, gesture: Gtk.GestureDrag, start_x: float, start_y: float) -> None:
+        surface = self.get_surface()
+        if surface is None:
+            return
+        device = gesture.get_device()
+        button = gesture.get_current_button()
+        sequence = gesture.get_current_sequence()
+        event = gesture.get_last_event(sequence)
+        timestamp = event.get_time() if event is not None else Gdk.CURRENT_TIME
+        try:
+            # Standard GTK4 pattern for custom-drag (undecorated) windows.
+            # Works on both X11 and Wayland compositors that implement the
+            # relevant move-request (xdg-toplevel "move" on Wayland,
+            # _NET_WM_MOVERESIZE on X11) -- GTK picks the right one.
+            surface.begin_move(device, button, start_x, start_y, timestamp)
+        except (AttributeError, TypeError):
+            # Older/newer GTK versions may have a slightly different
+            # signature; fail quietly rather than crash the app.
+            pass
+
+    def on_drag_end(self, gesture: Gtk.GestureDrag, offset_x: float, offset_y: float) -> None:
+        self._save_position()
+
+    # -- Polling ----------------------------------------------------------
+
+    def poll_all_services(self) -> bool:
+        rows = list(self.services_by_row)
+
+        def worker() -> None:
+            results = []
+            for row in rows:
+                try:
+                    active = row.service.is_active()
+                except Exception:
+                    active = False
+                results.append((row, active))
+            GLib.idle_add(self._apply_poll_results, results)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return GLib.SOURCE_CONTINUE
+
+    def _apply_poll_results(self, results: list[tuple[ServiceRow, bool]]) -> bool:
+        for row, active in results:
+            row.refresh_from_poll(active)
+        return GLib.SOURCE_REMOVE
+
+    # -- Position persistence ---------------------------------------------
+
+    def _load_size(self) -> tuple[int, int]:
+        try:
+            if CONFIG_FILE.exists():
+                data = json.loads(CONFIG_FILE.read_text())
+                width = int(data.get("width", 420))
+                height = int(data.get("height", 640))
+                return max(width, 300), max(height, 400)
+        except Exception:
+            pass
+        return 420, 640
+
+    def _save_position(self) -> None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            width = self.get_width()
+            height = self.get_height()
+            data = {"width": width, "height": height}
+
+            # Best-effort: GTK4 does not expose a portable get-position API
+            # (Wayland deliberately disallows clients from querying/setting
+            # their own global position for security reasons). On X11 this
+            # could be attempted via lower-level Xlib calls, but that is
+            # outside plain GTK4/GDK and is intentionally not implemented
+            # here to keep this app portable across X11 and Wayland
+            # (labwc/wayfire) sessions on Raspberry Pi OS.
+            CONFIG_FILE.write_text(json.dumps(data, indent=2))
+        except Exception:
+            pass
+
+    def on_close_request(self, *_args) -> bool:
+        self._save_position()
+        return False  # allow the window to actually close
+
+
+class PiControlPanelApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="org.evan.pi_control_panel")
+        self.window: Optional[PiControlPanelWindow] = None
+
+    def do_activate(self) -> None:
+        self._load_css()
+        if self.window is None:
+            self.window = PiControlPanelWindow(self)
+        self.window.present()
+
+    def _load_css(self) -> None:
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        display = Gdk.Display.get_default()
+        if display is not None:
+            Gtk.StyleContext.add_provider_for_display(
+                display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
+
+
+def main() -> int:
+    if os.geteuid() == 0:
+        print(
+            "Warning: running as root is not required and not recommended. "
+            "This app uses 'sudo -n' internally for systemd actions; see "
+            "the module docstring for the NOPASSWD sudoers setup instead.",
+            flush=True,
+        )
+
+    app = PiControlPanelApp()
+    return app.run(None)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
